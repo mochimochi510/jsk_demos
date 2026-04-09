@@ -40,14 +40,15 @@ jobs:
             EXTRA_DEB : "python3-rospkg python3-rospkg-modules"  #  drc_task_common need rospkg, but not installed
             USE_DEB : false
 
-    container: ${{ matrix.CONTAINER }}
+    container:
+      image: ${{ matrix.CONTAINER }}
+      volumes:
+        - /tmp/node20:/__e/node20
+      options: --user root
+
     steps:
       - name: Install latest git ( use sudo for ros-ubuntu )
         run: |
-          # https://github.com/osrf/docker_images/issues/697#issuecomment-1819626877
-          sudo apt-key del 4B63CF8FDE49746E98FA01DDAD19BAB3CBF125EA || echo "OK"
-          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 4B63CF8FDE49746E98FA01DDAD19BAB3CBF125EA || echo "OK"
-          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys AD19BAB3CBF125EA || echo "OK"
           [ -e /etc/apt/sources.list.d/ubuntu-esm-infra-$(lsb_release -cs).list ] && sudo rm /etc/apt/sources.list.d/ubuntu-esm-infra-$(lsb_release -cs).list ## fix Err https://esm.ubuntu.com trusty-infra-security/main amd64 Packages, gnutls_handshake() failed: Handshake failed
           (apt-get update && apt-get install -y sudo) || echo "OK"
           sudo apt-get update
@@ -66,12 +67,26 @@ jobs:
           sudo mkdir -p /__w/
           sudo chmod 777 -R /__w/
           sudo chown -R $USER $HOME
+          sudo mkdir  -p /__w/_temp/_runner_file_commands/
+          sudo chown -R $USER /__w/_temp/_runner_file_commands/
           # sudo mkdir -p /home/runner/work/_temp/_github_workflow/
           # sudo chown -R $USER $HOME /home/runner/work/_temp/_github_workflow/
           # ls -al /home/runner/work/_temp/_github_workflow/
 
+      - name: Try to replace `node` with an glibc 2.17
+        shell: bash
+        run: |
+          ls -lar /__e/node20 &&
+          sudo apt-get install -y curl &&
+          curl -Lo /tmp/node.tar.gz https://unofficial-builds.nodejs.org/download/release/v20.17.0/node-v20.17.0-linux-x64-glibc-217.tar.gz &&
+          cd /__e/node20 &&
+          tar -x --strip-components=1 -f /tmp/node.tar.gz &&
+          ls -lar /__e/node20/bin/
+
       - name: Chcekout
         uses: actions/checkout@v3.0.2
+        with:
+          submodules: true
 
       - name: Start X server
         run: |
