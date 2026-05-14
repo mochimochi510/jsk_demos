@@ -20,10 +20,8 @@
 ;; (send *ri* :wait-interpolation)
 )
 
-;; 腕をしまう
-(pr2-tuckarm-pose :larm)
-(send *ri* :angle-vector (send *pr2* angle-vector) 3000)
-(send *ri* :wait-interpolation)
+;; 初期姿勢(腕を上げた位置)
+(apply-angle-vector "initial_uphand_pose.l")
 
 ;; キッチン前(sink0、おそらくIHの前?)の位置を設定
 (setq *sink0-model* (make-cascoords :pos #f(1175 1559 300) :rpy (list pi 0 0)))
@@ -61,22 +59,72 @@
 (apply-angle-vector "release-plate")
 
 ;; 火を止める
-(apply-angle-vetor "fire-off")
+(apply-angle-vector "fire-off")
 
-;; 一旦ここまで?
+;; 両手鍋を掴む
+(apply-angle-vector "grab-double-handled-pot")
 
-;; お玉を持つ(アタッチメントの使い方要確認)
+;; グリッパを閉じる
+(send *ri* :start-grasp)
 
-;; スープをすくう(鍋の上)
+;; 両手を同時に上に上げる(計120mm)
+(send *pr2* :rarm :move-end-pos #f(0 0 50) :world)
+(send *pr2* :larm :move-end-pos #f(0 0 50) :world)
+(send *pr2* :rarm :move-end-pos #f(0 0 30) :world)
+(send *pr2* :larm :move-end-pos #f(0 0 30) :world)
+(send *pr2* :rarm :move-end-pos #f(0 0 30) :world)
+(send *pr2* :larm :move-end-pos #f(0 0 30) :world)
+(send *pr2* :rarm :move-end-pos #f(0 0 10) :world)
+(send *pr2* :larm :move-end-pos #f(0 0 10) :world)
+;; (send *ri* :angle-vector (send *pr2* :angle-vector) 3000)
+;; (send *ri* :wait-interpolation)
 
-;; スープを皿に入れる
+;; 右に300mm移動
+(send *ri* :go-pos 0 -0.3 0)
+(send *ri* :wait-interpolation)
 
-;; 上２つの動作をスープがなくなるくらいまで繰り返す
+;; 鍋を傾けてラーメンを皿に入れる
+(setq rav (send *pr2* :rarm :angle-vector))
+(setq lav (send *pr2* :larm :angle-vector))
 
-;; 鍋を掴む
+(setf (elt rav 4) (+ (elt rav 4) 10.0))
+(setf (elt lav 4) (+ (elt lav 4) -10.0))
 
-;; 皿の上まで移動
+(setf (elt rav 6) (+ (elt rav 6) -60.0))
+(setf (elt lav 6) (+ (elt lav 6) 60.0))
 
-;; 麺を鍋から入れる
+(send *pr2* :rarm :angle-vector rav)
+(send *pr2* :larm :angle-vector lav)
+
+;; (send *ri* :angle-vector (send *pr2* :angle-vector) 3000)
+;; (send *ri* :wait-interpolation)
+
+;; 鍋の傾きを戻す
+(setq rav (send *pr2* :rarm :angle-vector))
+(setq lav (send *pr2* :larm :angle-vector))
+
+(setq rav (send *pr2* :rarm :angle-vector))
+(setq lav (send *pr2* :larm :angle-vector))
+
+(setf (elt rav 4) (+ (elt rav 4) -10.0))
+(setf (elt lav 4) (+ (elt lav 4) 10.0))
+
+(setf (elt rav 6) (+ (elt rav 6) 60.0))
+(setf (elt lav 6) (+ (elt lav 6) -60.0))
+
+(send *pr2* :rarm :angle-vector rav)
+(send *pr2* :larm :angle-vector lav)
+
+;; (send *ri* :angle-vector (send *pr2* :angle-vector) 3000)
+;; (send *ri* :wait-interpolation)
+
+;; 鍋をコンロの上に戻す
+(send *ri* :go-pos 0 0.3 0)
+(send *ri* :wait-interpolation)
 
 ;; 鍋を置く
+(send *pr2* :rarm :move-end-pos #f(0 0 -120) :world)
+(send *pr2* :larm :move-end-pos #f(0 0 -120) :world)
+;; (send *ri* :angle-vector (send *pr2* :angle-vector) 3000)
+;; (send *ri* :wait-interpolation)
+
