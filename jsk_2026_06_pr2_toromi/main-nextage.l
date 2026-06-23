@@ -1,17 +1,17 @@
 #!/usr/bin/env roseus
 
-(load "package://pr2eus/pr2-interface.l")
-(load "package://pr2eus/pr2.l")
+(require "package://nextage_tutorials/euslisp/nextage-utils.l")
 (load "models/room73b2-scene.l")
-(pr2-init)
+(nextage-init)
 
-(defparameter *toromi-robot* *pr2*)
+(defparameter *toromi-robot* *nextage*)
 (defparameter *toromi-ri* *ri*)
 (defparameter *pour-arm* :larm)
 (defparameter *stir-arm* :rarm)
 
 ;; Units are millimeters and milliseconds unless otherwise noted.
-(defparameter *cup-pos* #f(650 -120 750)) ;; TODO: replace with measured cup center in robot-local frame.
+;; TODO: replace with measured cup center in the Nextage waist-local frame.
+(defparameter *cup-pos* #f(450 -120 850))
 (defparameter *cup-height* 100.0)
 (defparameter *cup-depth* 95.0)
 (defparameter *cup-radius* 35.0)
@@ -29,11 +29,7 @@
 (defparameter *pour-side-offset* #f(0 25 0))
 (defparameter *pour-upright-rpy* (list 0 (deg2rad -95) 0))
 (defparameter *pour-tilted-rpy* (list 0 (deg2rad -25) 0))
-(defparameter *pour-larm-seed-joint-angles*
-  (list (list :shoulder-p 20)
-        (list :elbow-p -90)
-        (list :elbow-r 100)
-        (list :wrist-p -70)))
+(defparameter *pour-larm-seed-joint-angles* nil)
 (defparameter *pour-approach-time* 3000)
 (defparameter *pour-tilt-time* 1500)
 (defparameter *pour-hold-time* 3000)
@@ -94,9 +90,9 @@
     result))
 
 (defun apply-pour-arm-seed-pose ()
-  (when (eq *pour-arm* :larm)
-    (dolist (joint-angle *pour-larm-seed-joint-angles*)
-      (send *toromi-robot* :larm (car joint-angle) :joint-angle (cadr joint-angle)))))
+  (when (and (eq *pour-arm* :larm) *pour-larm-seed-joint-angles*)
+    (send *toromi-robot* :larm :angle-vector
+          (apply #'float-vector *pour-larm-seed-joint-angles*))))
 
 (defun solve-pour-arm-ik (target-coords &key (look-at-target t))
   (apply-pour-arm-seed-pose)
@@ -109,10 +105,45 @@
   (send *toromi-ri* :angle-vector-sequence av-seq time-seq)
   (when wait (send *toromi-ri* :wait-interpolation)))
 
+(defun ensure-viewer-objects ()
+  (when (boundp '*irtviewer*)
+    (objects (list *toromi-robot*))
+    (send *irtviewer* :draw-objects)))
+
+(defun draw-current-pose ()
+  (when (boundp '*irtviewer*)
+    (send *irtviewer* :draw-objects)))
+
+(defun show-av-sequence (av-seq &key (sleep-usec 200000))
+  "Replay angle-vector sequence on irtviewer without sending commands to the robot."
+  (ensure-viewer-objects)
+  (dolist (av av-seq)
+    (send *toromi-robot* :angle-vector av)
+    (draw-current-pose)
+    (unix:usleep sleep-usec))
+  (send *toromi-robot* :angle-vector))
+
+(defun show-plan (plan &key (sleep-usec 200000))
+  "Replay one plan returned by plan-pre-stir, plan-pour-powder, or plan-stir-cup."
+  (show-av-sequence (car plan) :sleep-usec sleep-usec))
+
+(defun show-plans (plans &key (sleep-usec 200000))
+  "Replay a list of plans such as the value returned by toromi-demo."
+  (dolist (plan plans)
+    (show-plan plan :sleep-usec sleep-usec))
+  (send *toromi-robot* :angle-vector))
+
+(defun show-toromi-demo (&key (sleep-usec 200000))
+  "Plan and replay the toromi demo on irtviewer without sending commands to the robot."
+  (let ((plans (toromi-demo :execute nil)))
+    (show-plans plans :sleep-usec sleep-usec)
+    plans))
+
 (defun reset-pose (&key (execute t) (time 3000))
-  (send *toromi-robot* :reset-manip-pose)
-  (send *toromi-robot* :larm :shoulder-p :joint-angle 20)
-  (send *toromi-robot* :rarm :shoulder-p :joint-angle 20)
+  (send *toromi-robot* :reset-pose)
+  (send *toromi-robot* :head :angle-vector #f(0 60))
+  (send *toromi-robot* :larm :move-end-pos #f(0 0 100))
+  (send *toromi-robot* :rarm :move-end-pos #f(0 0 100))
   (when execute
     (send *toromi-ri* :angle-vector (send *toromi-robot* :angle-vector) time)
     (send *toromi-ri* :wait-interpolation))
