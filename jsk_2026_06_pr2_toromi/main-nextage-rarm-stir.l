@@ -77,8 +77,8 @@
 (defun reset-pose (&key (execute t) (time 3000))
   (send *toromi-robot* :reset-pose)
   (send *toromi-robot* :head :angle-vector #f(0 30))
-  (send *toromi-robot* :larm :move-end-pos #f(0 0 100))
-  (send *toromi-robot* :rarm :move-end-pos #f(0 0 100))
+  (send *toromi-robot* :larm :move-end-pos #f(0 0 150))
+  (send *toromi-robot* :rarm :move-end-pos #f(0 0 150))
   (when execute
     (send *toromi-ri* :angle-vector (send *toromi-robot* :angle-vector) time)
     (send *toromi-ri* :wait-interpolation))
