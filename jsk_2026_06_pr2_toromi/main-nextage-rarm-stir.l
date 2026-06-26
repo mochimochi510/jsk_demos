@@ -1,12 +1,14 @@
 #!/usr/bin/env roseus
 
 (require "package://nextage_tutorials/euslisp/nextage-utils.l")
+(ros::roseus-add-msgs "std_msgs")
 (load "models/room73b2-scene.l")
 (nextage-init)
 
 (defparameter *toromi-robot* *nextage*)
 (defparameter *toromi-ri* *ri*)
 (defparameter *stir-arm* :rarm)
+(defparameter *motion-marker-topic* "/toromi/motion_marker")
 
 ;; Units are millimeters and milliseconds unless otherwise noted.
 ;; TODO: replace with measured cup center in the Nextage waist-local frame.
@@ -73,6 +75,22 @@
 (defun execute-av-sequence (av-seq time-seq &key (wait t))
   (send *toromi-ri* :angle-vector-sequence av-seq time-seq)
   (when wait (send *toromi-ri* :wait-interpolation)))
+
+(defun init-motion-marker-publisher ()
+  (unless (ros::get-topic-publisher *motion-marker-topic*)
+    (ros::advertise *motion-marker-topic* std_msgs::Header 10)))
+
+(defun publish-motion-marker (event-name)
+  (init-motion-marker-publisher)
+  (let ((stamp (ros::time-now)))
+    (dotimes (i 5)
+      (ros::publish
+       *motion-marker-topic*
+       (instance std_msgs::Header :init
+                 :stamp stamp
+                 :frame_id event-name))
+      (unix:usleep 10000))
+    stamp))
 
 (defun reset-pose (&key (execute t) (time 3000))
   (send *toromi-robot* :reset-pose)
@@ -282,7 +300,10 @@
                 (plan-rarm-stir :motion motion :mode mode))))
     (when execute
       (reset-pose :execute t)
+      (publish-motion-marker "rarm_stir_start")
       (execute-av-sequence (car plan) (cadr plan))
+      (publish-motion-marker "rarm_stir_motion_end")
       (send *toromi-robot* :angle-vector (car (last (car plan))))
-      (finish-rarm-stir))
+      (finish-rarm-stir)
+      (publish-motion-marker "rarm_stir_finish_end"))
     plan))
