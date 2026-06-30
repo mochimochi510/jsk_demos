@@ -29,7 +29,6 @@
 (defparameter *stir-cycle-steps* 12)
 (defparameter *stir-linear-cycle-steps* 13)
 (defparameter *stir-repeat-count* 5)
-(defparameter *stir-pause-time* 10000)
 (defparameter *scoop-lift-height* 3.0)
 (defparameter *pre-stir-right-offset* #f(0 -70 0))
 (defparameter *pre-stir-height* 55.0)
@@ -75,6 +74,10 @@
 (defun execute-av-sequence (av-seq time-seq &key (wait t))
   (send *toromi-ri* :angle-vector-sequence av-seq time-seq)
   (when wait (send *toromi-ri* :wait-interpolation)))
+
+(defun wait-before-stir ()
+  (format t "~%Reached stir start position. Press Enter to start stirring.~%")
+  (read-line))
 
 (defun init-motion-marker-publisher ()
   (unless (ros::get-topic-publisher *motion-marker-topic*)
@@ -215,9 +218,16 @@
      (t
       (error "Unknown stir motion: ~A" motion)))))
 
-(defun plan-rarm-stir (&key (motion :circle) (mode :continuous))
-  (let ((steps (max 1 (round (/ (float *stir-duration*) *stir-step-time*))))
-        av-seq
+(defun continuous-stir-steps (motion repeat-count)
+  (if repeat-count
+      (progn
+        (when (< repeat-count 1)
+          (error "repeat-count must be >= 1: ~A" repeat-count))
+        (* (round repeat-count) (stir-motion-cycle-steps motion)))
+    (max 1 (round (/ (float *stir-duration*) *stir-step-time*)))))
+
+(defun plan-rarm-stir (&key (motion :circle) (mode :continuous) (repeat-count nil))
+  (let (av-seq
         time-seq)
     (solve-rarm-ik (rhand-spoon-coords (pre-stir-tip-pos)))
     (push (current-av) av-seq)
@@ -231,7 +241,7 @@
     (let ((step-times (stir-motion-step-times motion)))
       (cond
        ((eq mode :continuous)
-        (dotimes (i steps)
+        (dotimes (i (continuous-stir-steps motion repeat-count))
           (let ((target (stir-motion-target motion i)))
             (solve-rarm-ik (rhand-spoon-coords (car target) (cadr target)))
             (push (current-av) av-seq)
@@ -248,10 +258,7 @@
             (let ((target (stir-motion-target motion i)))
               (solve-rarm-ik (rhand-spoon-coords (car target) (cadr target)))
               (push (current-av) av-seq)
-              (push (nth i step-times) time-seq)))
-          (when (< j (- *stir-repeat-count* 1))
-            (push (current-av) av-seq)
-            (push *stir-pause-time* time-seq))))
+              (push (nth i step-times) time-seq)))))
        (t
         (error "Unknown stir mode: ~A" mode))))
 
@@ -264,8 +271,8 @@
 
     (list (reverse av-seq) (reverse time-seq))))
 
-(defun plan-rarm-stir-circle ()
-  (let ((steps (max 1 (round (/ (float *stir-duration*) *stir-step-time*))))
+(defun plan-rarm-stir-circle (&key (repeat-count nil))
+  (let ((steps (continuous-stir-steps :circle repeat-count))
         av-seq
         time-seq)
     (solve-rarm-ik (rhand-spoon-coords (pre-stir-tip-pos)))
@@ -292,16 +299,20 @@
 
     (list (reverse av-seq) (reverse time-seq))))
 
-(defun rarm-stir-demo (&key (execute t) (motion :circle) (mode :continuous))
+(defun rarm-stir-demo (&key (execute t) (motion :circle) (mode :continuous) (repeat-count nil))
   "Move from the initial pose, keep the left arm fixed, and stir with the right arm."
   (reset-pose :execute nil)
   (let ((plan (if (and (eq motion :circle) (eq mode :continuous))
-                  (plan-rarm-stir-circle)
-                (plan-rarm-stir :motion motion :mode mode))))
+                  (plan-rarm-stir-circle :repeat-count repeat-count)
+                (plan-rarm-stir :motion motion :mode mode :repeat-count repeat-count))))
     (when execute
       (reset-pose :execute t)
+      (publish-motion-marker "rarm_stir_prepare_start")
+      (execute-av-sequence (subseq (car plan) 0 2) (subseq (cadr plan) 0 2))
+      (publish-motion-marker "rarm_stir_pause_start")
+      (wait-before-stir)
       (publish-motion-marker "rarm_stir_start")
-      (execute-av-sequence (car plan) (cadr plan))
+      (execute-av-sequence (subseq (car plan) 2) (subseq (cadr plan) 2))
       (publish-motion-marker "rarm_stir_motion_end")
       (send *toromi-robot* :angle-vector (car (last (car plan))))
       (finish-rarm-stir)
