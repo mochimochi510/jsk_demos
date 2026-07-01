@@ -34,6 +34,8 @@
 (defparameter *pre-stir-height* 55.0)
 (defparameter *pre-stir-time* 3000)
 (defparameter *stir-approach-time* 3000)
+(defparameter *stir-start-lower-time* 1000)
+(defparameter *stir-start-resync-time* 500)
 (defparameter *stir-exit-time* 2000)
 
 (defun robot-local-pos (pos)
@@ -76,8 +78,23 @@
   (when wait (send *toromi-ri* :wait-interpolation)))
 
 (defun wait-before-stir ()
-  (format t "~%Reached stir start position. Press Enter to start stirring.~%")
-  (read-line))
+  (format t "~%Reached stir start position. Waiting 5 seconds before stirring.~%")
+  (unix:sleep 3))
+
+(defun wait-before-lift ()
+  (format t "~%Finished stirring. Waiting 5 seconds before lifting the spoon.~%")
+  (unix:sleep 3))
+
+(defun stir-start-approach-times (time-seq)
+  (let ((approach-times (subseq time-seq 0 3)))
+    (setf (nth 2 approach-times) *stir-start-lower-time*)
+    approach-times))
+
+(defun resync-stir-start-pose (plan)
+  (let ((start-av (nth 2 (car plan))))
+    (send *toromi-robot* :angle-vector start-av)
+    (send *toromi-ri* :angle-vector start-av *stir-start-resync-time*)
+    (send *toromi-ri* :wait-interpolation)))
 
 (defun init-motion-marker-publisher ()
   (unless (ros::get-topic-publisher *motion-marker-topic*)
@@ -308,12 +325,15 @@
     (when execute
       (reset-pose :execute t)
       (publish-motion-marker "rarm_stir_prepare_start")
-      (execute-av-sequence (subseq (car plan) 0 2) (subseq (cadr plan) 0 2))
+      (execute-av-sequence (subseq (car plan) 0 3) (stir-start-approach-times (cadr plan)))
       (publish-motion-marker "rarm_stir_pause_start")
       (wait-before-stir)
+      (resync-stir-start-pose plan)
       (publish-motion-marker "rarm_stir_start")
-      (execute-av-sequence (subseq (car plan) 2) (subseq (cadr plan) 2))
+      (execute-av-sequence (subseq (car plan) 3) (subseq (cadr plan) 3))
       (publish-motion-marker "rarm_stir_motion_end")
+      (publish-motion-marker "rarm_stir_lift_pause_start")
+      (wait-before-lift)
       (send *toromi-robot* :angle-vector (car (last (car plan))))
       (finish-rarm-stir)
       (publish-motion-marker "rarm_stir_finish_end"))
