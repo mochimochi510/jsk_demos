@@ -19,15 +19,18 @@
 
 (defparameter *spoon-tip-offset-from-rhand* #f(0 0 180))
 (defparameter *stir-radius* 8.0)
-(defparameter *stir-z-line-half-range* 3.0)
+(defparameter *stir-z-line-half-range* 1.0)
 (defparameter *stir-depth-from-cup-top* 105.0)
 (defparameter *stir-duration* 120000)
-(defparameter *stir-step-time* 40)
+(defparameter *stir-step-time* 20)
 (defparameter *stir-approach-height* 30.0)
 (defparameter *stir-rpy* (list (deg2rad 90) 0 0))
 (defparameter *scoop-tilted-rpy* (list (deg2rad 90) (deg2rad -35) 0))
 (defparameter *stir-cycle-steps* 12)
-(defparameter *stir-linear-cycle-steps* 13)
+(defparameter *stir-linear-cycle-steps* 14)
+(defparameter *stir-pause-time* 3000)
+(defparameter *stir-linear-static-time* *stir-pause-time*)
+(defparameter *stir-linear-default-move-time* 1000)
 (defparameter *stir-repeat-count* 5)
 (defparameter *scoop-lift-height* 3.0)
 (defparameter *pre-stir-right-offset* #f(0 -70 0))
@@ -44,8 +47,22 @@
 (defun cup-top-pos ()
   (v+ (robot-local-pos *cup-pos*) (float-vector 0 0 *cup-top-z-offset*)))
 
-(defun cup-stir-center-pos ()
-  (v+ (cup-top-pos) (float-vector 0 0 (- *stir-depth-from-cup-top*))))
+(defun stir-depth-from-offset (stir-depth-offset)
+  (- *stir-depth-from-cup-top* stir-depth-offset))
+
+(defun resolve-stir-depth-offset (stir-depth-offset stir-depth-from-cup-top)
+  (when (and stir-depth-offset stir-depth-from-cup-top)
+    (error "Specify only one of stir-depth-offset or stir-depth-from-cup-top."))
+  (if stir-depth-offset
+      stir-depth-offset
+    (if stir-depth-from-cup-top
+        stir-depth-from-cup-top
+      0.0)))
+
+(defun cup-stir-center-pos
+  (&optional (stir-depth-offset 0.0))
+  (v+ (cup-top-pos)
+      (float-vector 0 0 (- (stir-depth-from-offset stir-depth-offset)))))
 
 (defun target-coords-from-tool-tip (tip-pos rpy tool-offset)
   (send (make-coords :pos tip-pos :rpy rpy)
@@ -78,8 +95,9 @@
   (when wait (send *toromi-ri* :wait-interpolation)))
 
 (defun wait-before-stir ()
-  (format t "~%Reached stir start position. Waiting 5 seconds before stirring.~%")
-  (unix:sleep 3))
+  (format t "~%Reached stir start position. Waiting ~A ms before stirring.~%"
+          *stir-pause-time*)
+  (unix:usleep (* *stir-pause-time* 1000)))
 
 (defun wait-before-lift ()
   (format t "~%Finished stirring. Waiting 5 seconds before lifting the spoon.~%")
@@ -112,6 +130,17 @@
       (unix:usleep 10000))
     stamp))
 
+(defun cycle-start-event-name (cycle-number)
+  (cond
+   ((< cycle-number 10)
+    (format nil "cycle_start_000~D" cycle-number))
+   ((< cycle-number 100)
+    (format nil "cycle_start_00~D" cycle-number))
+   ((< cycle-number 1000)
+    (format nil "cycle_start_0~D" cycle-number))
+   (t
+    (format nil "cycle_start_~D" cycle-number))))
+
 (defun reset-pose (&key (execute t) (time 3000))
   (send *toromi-robot* :reset-pose)
   (send *toromi-robot* :head :angle-vector #f(0 30))
@@ -140,15 +169,17 @@
   (v+ (v+ (cup-top-pos) *pre-stir-right-offset*)
       (float-vector 0 0 *pre-stir-height*)))
 
-(defun stir-tip-pos (theta &optional (z-offset 0.0))
-  (let ((center (cup-stir-center-pos)))
+(defun stir-tip-pos
+  (theta &optional (z-offset 0.0) (stir-depth-offset 0.0))
+  (let ((center (cup-stir-center-pos stir-depth-offset)))
     (v+ center
         (float-vector (* *stir-radius* (cos theta))
                       (* *stir-radius* (sin theta))
                       z-offset))))
 
-(defun stir-tip-pos-from-offset (x y z &optional (z-offset 0.0))
-  (v+ (cup-stir-center-pos)
+(defun stir-tip-pos-from-offset
+  (x y z &optional (z-offset 0.0) (stir-depth-offset 0.0))
+  (v+ (cup-stir-center-pos stir-depth-offset)
       (float-vector x y (+ z z-offset))))
 
 (defun line-motion-p (motion)
@@ -162,53 +193,234 @@
 (defun stir-motion-cycle-time (motion)
   (* *stir-cycle-steps* *stir-step-time*))
 
-(defun stir-motion-step-times (motion)
-  (let* ((cycle-steps (stir-motion-cycle-steps motion))
-         (cycle-time (stir-motion-cycle-time motion))
-         (base-time (floor (/ cycle-time (float cycle-steps))))
-         (extra-count (mod cycle-time cycle-steps)))
-    (let (time-seq)
-      (dotimes (i cycle-steps)
-        (push (+ base-time (if (< i extra-count) 1 0)) time-seq))
-      (reverse time-seq))))
+(defun positive-number (value name)
+  (when (<= value 0)
+    (error "~A must be > 0: ~A" name value))
+  value)
+
+(defun integer-duration (value name)
+  (round (positive-number value name)))
+
+(defun split-duration (duration count)
+  (let* ((total (integer-duration duration "duration"))
+         (base-time (floor (/ total (float count))))
+         (extra-count (mod total count))
+         time-seq)
+    (dotimes (i count)
+      (push (+ base-time (if (< i extra-count) 1 0)) time-seq))
+    (reverse time-seq)))
+
+(defun number-list-sum (numbers)
+  (let ((rest numbers)
+        (sum 0))
+    (while rest
+      (setq sum (+ sum (car rest)))
+      (setq rest (cdr rest)))
+    sum))
+
+(defun stir-linear-half-range (motion)
+  (if (eq motion :z-line)
+      *stir-z-line-half-range*
+    *stir-radius*))
+
+(defun stir-linear-full-range (motion)
+  (* 2.0 (stir-linear-half-range motion)))
+
+(defun stir-linear-leg-steps ()
+  (let ((movable-steps (- *stir-linear-cycle-steps* 2)))
+    (unless (= (mod movable-steps 2) 0)
+      (error "*stir-linear-cycle-steps* - 2 must be even: ~A"
+             *stir-linear-cycle-steps*))
+    (floor (/ movable-steps 2))))
+
+(defun stir-linear-negative-end-index ()
+  (stir-linear-leg-steps))
+
+(defun stir-linear-negative-static-index ()
+  (+ (stir-linear-negative-end-index) 1))
+
+(defun resolve-linear-move-time (motion linear-speed linear-move-time)
+  (when (and linear-speed linear-move-time)
+    (error "Specify only one of linear-speed or linear-move-time."))
+  (cond
+   (linear-move-time
+    (integer-duration linear-move-time "linear-move-time"))
+   (linear-speed
+    (integer-duration
+     (* 1000.0 (/ (stir-linear-full-range motion)
+                  (positive-number linear-speed "linear-speed")))
+     "linear-speed move time"))
+   (t
+    (integer-duration
+     *stir-linear-default-move-time* "*stir-linear-default-move-time*"))))
+
+(defun linear-stir-motion-step-times
+  (motion linear-speed linear-move-time)
+  (let ((move-time (resolve-linear-move-time
+                    motion linear-speed linear-move-time))
+        (static-time (integer-duration
+                      *stir-linear-static-time* "*stir-linear-static-time*"))
+        (leg-steps (stir-linear-leg-steps)))
+    (append
+     (list static-time)
+     (split-duration move-time leg-steps)
+     (list static-time)
+     (split-duration move-time leg-steps))))
+
+(defun stir-motion-step-times
+  (motion &key (linear-speed nil)
+               (linear-move-time nil))
+  (cond
+   ((line-motion-p motion)
+    (linear-stir-motion-step-times motion linear-speed linear-move-time))
+   ((or linear-speed linear-move-time)
+    (error "linear-speed/linear-move-time are only valid for line motions: ~A" motion))
+   (t
+    (let* ((cycle-steps (stir-motion-cycle-steps motion))
+           (cycle-time (stir-motion-cycle-time motion))
+           (base-time (floor (/ cycle-time (float cycle-steps))))
+           (extra-count (mod cycle-time cycle-steps)))
+      (let (time-seq)
+        (dotimes (i cycle-steps)
+          (push (+ base-time (if (< i extra-count) 1 0)) time-seq))
+        (reverse time-seq))))))
 
 (defun stir-linear-offset (cycle-i &optional (half-range *stir-radius*))
-  (let* ((phase (/ cycle-i (float (max 1 (- *stir-linear-cycle-steps* 1)))))
-         (down-phase 0.25)
-         (center-phase 0.5)
-         (up-phase 0.75))
-    (* half-range
-       (cond
-        ((< phase down-phase)
-         (- (/ phase down-phase)))
-        ((< phase center-phase)
-         (+ -1.0 (/ (- phase down-phase)
-                    (- center-phase down-phase))))
-        ((< phase up-phase)
-         (/ (- phase center-phase)
-            (- up-phase center-phase)))
-        (t
-         (- 1.0 (/ (- phase up-phase)
-                   (- 1.0 up-phase))))))))
+  (let ((negative-end-i (stir-linear-negative-end-index))
+        (negative-static-i (stir-linear-negative-static-index)))
+    (cond
+     ((= cycle-i 0)
+      half-range)
+     ((<= cycle-i negative-end-i)
+      (+ half-range
+         (* -2.0 half-range
+            (/ cycle-i (float negative-end-i)))))
+     ((= cycle-i negative-static-i)
+      (- half-range))
+     (t
+      (+ (- half-range)
+         (* 2.0 half-range
+            (/ (- cycle-i negative-static-i)
+               (float (stir-linear-leg-steps)))))))))
 
-(defun stir-motion-target (motion i &optional (z-offset 0.0))
+(defun line-motion-name (motion)
+  (cond
+   ((eq motion :x-line) "x_line")
+   ((eq motion :y-line) "y_line")
+   ((eq motion :z-line) "z_line")
+   (t nil)))
+
+(defun stir-linear-stage-name (cycle-i)
+  (cond
+   ((= cycle-i 0) "positive_endpoint_static")
+   ((<= cycle-i (stir-linear-negative-end-index))
+    "move_to_negative_endpoint")
+   ((= cycle-i (stir-linear-negative-static-index))
+    "negative_endpoint_static")
+   (t "move_to_positive_endpoint")))
+
+(defun stir-linear-stage-event (motion cycle-i)
+  (let ((motion-name (line-motion-name motion)))
+    (when motion-name
+      (format nil "~A_~A" motion-name (stir-linear-stage-name cycle-i)))))
+
+(defun next-stir-cycle-index (stir-i cycle-steps)
+  (let ((cycle-i (mod stir-i cycle-steps)))
+    (if (= cycle-i 0)
+        (+ stir-i cycle-steps)
+      (+ stir-i (- cycle-steps cycle-i)))))
+
+(defun stir-marker-chunk-end-index (motion stir-i end-stir-i)
+  (let* ((cycle-steps (stir-motion-cycle-steps motion))
+         (cycle-end (min end-stir-i
+                         (next-stir-cycle-index stir-i cycle-steps))))
+    (if (line-motion-p motion)
+        (let ((event (stir-linear-stage-event motion (mod stir-i cycle-steps)))
+              (j (+ stir-i 1)))
+          (while (and (< j cycle-end)
+                      (equal event
+                             (stir-linear-stage-event motion
+                                                      (mod j cycle-steps))))
+            (setq j (+ j 1)))
+          j)
+      cycle-end)))
+
+(defun continuous-cycle-start-p (stir-i first-stir-i cycle-steps)
+  (or (= stir-i first-stir-i)
+      (= (mod stir-i cycle-steps) 0)))
+
+(defun continuous-cycle-number (stir-i first-stir-i cycle-steps)
+  (if (= stir-i first-stir-i)
+      1
+    (+ (floor (/ stir-i cycle-steps)) 1)))
+
+(defun publish-initial-linear-state-marker (motion)
+  (when (line-motion-p motion)
+    (publish-motion-marker (stir-linear-stage-event motion 0))))
+
+(defun execute-stir-motion-with-markers
+  (av-seq time-seq motion mode &optional (first-stir-i 1))
+  (if (and (not (line-motion-p motion))
+           (not (eq mode :continuous)))
+      (execute-av-sequence av-seq time-seq)
+    (let* ((cycle-steps (stir-motion-cycle-steps motion))
+           (end-stir-i (+ first-stir-i (length av-seq)))
+           (stir-i first-stir-i))
+      (while (< stir-i end-stir-i)
+        (let* ((seq-start (- stir-i first-stir-i))
+               (chunk-end (stir-marker-chunk-end-index motion stir-i end-stir-i))
+               (seq-end (- chunk-end first-stir-i)))
+          (when (and (eq mode :continuous)
+                     (continuous-cycle-start-p stir-i first-stir-i cycle-steps))
+            (publish-motion-marker
+             (cycle-start-event-name
+              (continuous-cycle-number stir-i first-stir-i cycle-steps))))
+          (when (line-motion-p motion)
+            (publish-motion-marker
+             (stir-linear-stage-event motion (mod stir-i cycle-steps))))
+          (execute-av-sequence
+           (subseq av-seq seq-start seq-end)
+           (subseq time-seq seq-start seq-end))
+          (setq stir-i chunk-end))))))
+
+(defun final-linear-positive-endpoint-pause-p
+  (motion stir-count &optional (first-stir-i 1))
+  (when (and (line-motion-p motion) (> stir-count 0))
+    (let* ((cycle-steps (stir-motion-cycle-steps motion))
+           (last-stir-i (+ first-stir-i stir-count -1)))
+      (= (mod last-stir-i cycle-steps) (- cycle-steps 1)))))
+
+(defun execute-final-linear-endpoint-pause
+  (av-seq motion &optional (first-stir-i 1))
+  (when (final-linear-positive-endpoint-pause-p
+         motion (length av-seq) first-stir-i)
+    (publish-motion-marker (stir-linear-stage-event motion 0))
+    (execute-av-sequence
+     (list (car (last av-seq)))
+     (list *stir-linear-static-time*))))
+
+(defun stir-motion-target
+  (motion i &optional (z-offset 0.0) (stir-depth-offset 0.0))
   (let* ((cycle-steps (stir-motion-cycle-steps motion))
          (cycle-i (mod i cycle-steps))
          (theta (* 2 pi (/ cycle-i (float cycle-steps)))))
     (cond
      ((eq motion :circle)
-      (list (stir-tip-pos theta z-offset) *stir-rpy*))
+      (list (stir-tip-pos theta z-offset stir-depth-offset) *stir-rpy*))
      ((eq motion :reverse-circle)
-      (list (stir-tip-pos (- theta) z-offset) *stir-rpy*))
+      (list (stir-tip-pos (- theta) z-offset stir-depth-offset) *stir-rpy*))
      ((eq motion :x-line)
-      (list (stir-tip-pos-from-offset (stir-linear-offset cycle-i) 0 0 z-offset)
+      (list (stir-tip-pos-from-offset
+             (stir-linear-offset cycle-i) 0 0 z-offset stir-depth-offset)
             *stir-rpy*))
      ((eq motion :y-line)
-      (list (stir-tip-pos-from-offset 0 (stir-linear-offset cycle-i) 0 z-offset)
+      (list (stir-tip-pos-from-offset
+             0 (stir-linear-offset cycle-i) 0 z-offset stir-depth-offset)
             *stir-rpy*))
      ((eq motion :z-line)
       (list (stir-tip-pos-from-offset
-             0 0 (stir-linear-offset cycle-i *stir-z-line-half-range*) z-offset)
+             0 0 (stir-linear-offset cycle-i *stir-z-line-half-range*)
+             z-offset stir-depth-offset)
             *stir-rpy*))
      ((eq motion :scoop)
       (cond
@@ -217,62 +429,79 @@
                0 0
                (- *scoop-lift-height*
                   (* 2 *scoop-lift-height* (/ cycle-i 4.0)))
-               z-offset)
+               z-offset stir-depth-offset)
               *stir-rpy*))
        ((< cycle-i 9)
         (list (stir-tip-pos-from-offset
                0 0
                (+ (- *scoop-lift-height*)
                   (* 2 *scoop-lift-height* (/ (- cycle-i 4) 4.0)))
-               z-offset)
+               z-offset stir-depth-offset)
               *stir-rpy*))
        ((< cycle-i 11)
-        (list (stir-tip-pos-from-offset 0 0 *scoop-lift-height* z-offset)
+        (list (stir-tip-pos-from-offset
+               0 0 *scoop-lift-height* z-offset stir-depth-offset)
               *scoop-tilted-rpy*))
        (t
-        (list (stir-tip-pos-from-offset 0 0 *scoop-lift-height* z-offset)
+        (list (stir-tip-pos-from-offset
+               0 0 *scoop-lift-height* z-offset stir-depth-offset)
               *stir-rpy*))))
      (t
       (error "Unknown stir motion: ~A" motion)))))
 
-(defun continuous-stir-steps (motion repeat-count)
+(defun continuous-stir-steps (motion repeat-count &key (step-times nil))
   (if repeat-count
       (progn
         (when (< repeat-count 1)
           (error "repeat-count must be >= 1: ~A" repeat-count))
         (* (round repeat-count) (stir-motion-cycle-steps motion)))
-    (max 1 (round (/ (float *stir-duration*) *stir-step-time*)))))
+    (let* ((cycle-steps (stir-motion-cycle-steps motion))
+           (cycle-time (if step-times
+                           (number-list-sum step-times)
+                         (stir-motion-cycle-time motion)))
+           (average-step-time (/ (float cycle-time) cycle-steps)))
+      (max 1 (round (/ (float *stir-duration*) average-step-time))))))
 
-(defun plan-rarm-stir (&key (motion :circle) (mode :continuous) (repeat-count nil))
-  (let (av-seq
+(defun plan-rarm-stir
+  (&key (motion :circle) (mode :continuous) (repeat-count nil)
+        (linear-speed nil) (linear-move-time nil)
+        (stir-depth-offset nil) (stir-depth-from-cup-top nil))
+  (let ((depth-offset (resolve-stir-depth-offset
+                       stir-depth-offset stir-depth-from-cup-top))
+        av-seq
         time-seq)
     (solve-rarm-ik (rhand-spoon-coords (pre-stir-tip-pos)))
     (push (current-av) av-seq)
     (push *pre-stir-time* time-seq)
 
-    (let ((target (stir-motion-target motion 0 *stir-approach-height*)))
+    (let ((target (stir-motion-target
+                   motion 0 *stir-approach-height* depth-offset)))
       (solve-rarm-ik (rhand-spoon-coords (car target) (cadr target)))
       (push (current-av) av-seq)
       (push *stir-approach-time* time-seq))
 
-    (let ((step-times (stir-motion-step-times motion)))
+    (let ((step-times (stir-motion-step-times
+                       motion
+                       :linear-speed linear-speed
+                       :linear-move-time linear-move-time)))
       (cond
        ((eq mode :continuous)
-        (dotimes (i (continuous-stir-steps motion repeat-count))
-          (let ((target (stir-motion-target motion i)))
+        (dotimes (i (continuous-stir-steps
+                     motion repeat-count :step-times step-times))
+          (let ((target (stir-motion-target motion i 0.0 depth-offset)))
             (solve-rarm-ik (rhand-spoon-coords (car target) (cadr target)))
             (push (current-av) av-seq)
             (push (nth (mod i (length step-times)) step-times) time-seq))))
        ((eq mode :once)
         (dotimes (i (stir-motion-cycle-steps motion))
-          (let ((target (stir-motion-target motion i)))
+          (let ((target (stir-motion-target motion i 0.0 depth-offset)))
             (solve-rarm-ik (rhand-spoon-coords (car target) (cadr target)))
             (push (current-av) av-seq)
             (push (nth i step-times) time-seq))))
        ((eq mode :five)
         (dotimes (j *stir-repeat-count*)
           (dotimes (i (stir-motion-cycle-steps motion))
-            (let ((target (stir-motion-target motion i)))
+            (let ((target (stir-motion-target motion i 0.0 depth-offset)))
               (solve-rarm-ik (rhand-spoon-coords (car target) (cadr target)))
               (push (current-av) av-seq)
               (push (nth i step-times) time-seq)))))
@@ -288,8 +517,12 @@
 
     (list (reverse av-seq) (reverse time-seq))))
 
-(defun plan-rarm-stir-circle (&key (repeat-count nil))
+(defun plan-rarm-stir-circle
+  (&key (repeat-count nil)
+        (stir-depth-offset nil) (stir-depth-from-cup-top nil))
   (let ((steps (continuous-stir-steps :circle repeat-count))
+        (depth-offset (resolve-stir-depth-offset
+                       stir-depth-offset stir-depth-from-cup-top))
         av-seq
         time-seq)
     (solve-rarm-ik (rhand-spoon-coords (pre-stir-tip-pos)))
@@ -297,13 +530,16 @@
     (push *pre-stir-time* time-seq)
 
     (solve-rarm-ik (rhand-spoon-coords
-                    (stir-tip-pos 0 *stir-approach-height*)))
+                    (stir-tip-pos
+                     0 *stir-approach-height* depth-offset)))
     (push (current-av) av-seq)
     (push *stir-approach-time* time-seq)
 
     (dotimes (i steps)
       (let ((theta (* 2 pi (/ i 12.0))))
-        (solve-rarm-ik (rhand-spoon-coords (stir-tip-pos theta)))
+        (solve-rarm-ik
+         (rhand-spoon-coords
+          (stir-tip-pos theta 0.0 depth-offset)))
         (push (current-av) av-seq)
         (push *stir-step-time* time-seq)))
 
@@ -316,25 +552,51 @@
 
     (list (reverse av-seq) (reverse time-seq))))
 
-(defun rarm-stir-demo (&key (execute t) (motion :circle) (mode :continuous) (repeat-count nil))
+(defun rarm-stir-demo
+  (&key (execute t) (motion :circle) (mode :continuous) (repeat-count nil)
+        (linear-speed nil) (linear-move-time nil)
+        (stir-depth-offset nil) (stir-depth-from-cup-top nil))
   "Move from the initial pose, keep the left arm fixed, and stir with the right arm."
-  (reset-pose :execute nil)
-  (let ((plan (if (and (eq motion :circle) (eq mode :continuous))
-                  (plan-rarm-stir-circle :repeat-count repeat-count)
-                (plan-rarm-stir :motion motion :mode mode :repeat-count repeat-count))))
+  (when (and (not (line-motion-p motion))
+             (or linear-speed linear-move-time))
+    (error "linear-speed/linear-move-time are only valid for line motions: ~A" motion))
+  (let ((depth-offset (resolve-stir-depth-offset
+                       stir-depth-offset stir-depth-from-cup-top)))
+    (reset-pose :execute nil)
+    (let ((plan (if (and (eq motion :circle) (eq mode :continuous))
+                    (plan-rarm-stir-circle
+                     :repeat-count repeat-count
+                     :stir-depth-offset depth-offset)
+                  (plan-rarm-stir
+                   :motion motion
+                   :mode mode
+                   :repeat-count repeat-count
+                   :linear-speed linear-speed
+                   :linear-move-time linear-move-time
+                   :stir-depth-offset depth-offset))))
     (when execute
       (reset-pose :execute t)
       (publish-motion-marker "rarm_stir_prepare_start")
       (execute-av-sequence (subseq (car plan) 0 3) (stir-start-approach-times (cadr plan)))
       (publish-motion-marker "rarm_stir_pause_start")
+      (publish-initial-linear-state-marker motion)
+      (publish-motion-marker "baseline_start")
       (wait-before-stir)
       (resync-stir-start-pose plan)
+      (publish-motion-marker "baseline_end")
       (publish-motion-marker "rarm_stir_start")
-      (execute-av-sequence (subseq (car plan) 3) (subseq (cadr plan) 3))
+      (let ((stir-av-seq (subseq (car plan) 3))
+            (stir-time-seq (subseq (cadr plan) 3)))
+        (execute-stir-motion-with-markers
+         stir-av-seq
+         stir-time-seq
+         motion
+         mode)
+        (execute-final-linear-endpoint-pause stir-av-seq motion))
       (publish-motion-marker "rarm_stir_motion_end")
       (publish-motion-marker "rarm_stir_lift_pause_start")
       (wait-before-lift)
       (send *toromi-robot* :angle-vector (car (last (car plan))))
       (finish-rarm-stir)
       (publish-motion-marker "rarm_stir_finish_end"))
-    plan))
+    plan)))
