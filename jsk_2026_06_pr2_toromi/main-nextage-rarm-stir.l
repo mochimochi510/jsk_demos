@@ -8,6 +8,7 @@
 (defparameter *toromi-robot* *nextage*)
 (defparameter *toromi-ri* *ri*)
 (defparameter *stir-arm* :rarm)
+(defparameter *pour-arm* :larm)
 (defparameter *motion-marker-topic* "/toromi/motion_marker")
 
 ;; Units are millimeters and milliseconds unless otherwise noted.
@@ -40,6 +41,18 @@
 (defparameter *stir-start-lower-time* 1000)
 (defparameter *stir-start-resync-time* 500)
 (defparameter *stir-exit-time* 2000)
+
+;; Positive Y is robot-left. Keep the powder mouth slightly left of the
+;; cup center, with the held container protruding 50 mm to robot-right.
+(defparameter *powder-pour-mouth-left-offset* #f(0 25 0))
+(defparameter *powder-container-mouth-offset-from-lhand* #f(0 -50 0))
+(defparameter *powder-pour-level-rpy* (list 0 (deg2rad -95) 0))
+(defparameter *powder-pour-tilted-rpy* (list 0 (deg2rad -25) 0))
+(defparameter *powder-pour-approach-time* 3000)
+(defparameter *powder-pour-tilt-time* 1500)
+(defparameter *powder-pour-hold-time* 3000)
+(defparameter *powder-pour-return-time* 3000)
+(defparameter *powder-pour-after-cycle-count* 2)
 
 (defun robot-local-pos (pos)
   (send *toromi-robot* :transform-vector pos))
@@ -75,6 +88,16 @@
    rpy
    *spoon-tip-offset-from-rhand*))
 
+(defun lhand-powder-pour-mouth-pos ()
+  (v+ (v+ (cup-top-pos) *powder-pour-mouth-left-offset*)
+      (float-vector 0 0 *pre-stir-height*)))
+
+(defun lhand-powder-pour-coords (&key (tilted nil))
+  (target-coords-from-tool-tip
+   (lhand-powder-pour-mouth-pos)
+   (if tilted *powder-pour-tilted-rpy* *powder-pour-level-rpy*)
+   *powder-container-mouth-offset-from-lhand*))
+
 (defun solve-rarm-ik (target-coords)
   (let ((result (send *toromi-robot* *stir-arm*
                       :inverse-kinematics
@@ -85,6 +108,18 @@
                       :debug-view nil)))
     (unless result
       (error "IK failed for ~A" *stir-arm*))
+    result))
+
+(defun solve-larm-powder-pour-ik (target-coords)
+  (let ((result (send *toromi-robot* *pour-arm*
+                      :inverse-kinematics
+                      target-coords
+                      :revert-if-fail nil
+                      :look-at-target t
+                      :rotation-axis :z
+                      :debug-view nil)))
+    (unless result
+      (error "IK failed for ~A" *pour-arm*))
     result))
 
 (defun current-av ()
@@ -217,6 +252,98 @@
       (setq sum (+ sum (car rest)))
       (setq rest (cdr rest)))
     sum))
+
+(defun plan-larm-powder-pour (start-larm-av)
+  (let (av-seq time-seq)
+    (solve-larm-powder-pour-ik (lhand-powder-pour-coords :tilted nil))
+    (push (send *toromi-robot* *pour-arm* :angle-vector) av-seq)
+    (push *powder-pour-approach-time* time-seq)
+
+    (solve-larm-powder-pour-ik (lhand-powder-pour-coords :tilted t))
+    (push (send *toromi-robot* *pour-arm* :angle-vector) av-seq)
+    (push *powder-pour-tilt-time* time-seq)
+
+    (push (send *toromi-robot* *pour-arm* :angle-vector) av-seq)
+    (push *powder-pour-hold-time* time-seq)
+
+    (solve-larm-powder-pour-ik (lhand-powder-pour-coords :tilted nil))
+    (push (send *toromi-robot* *pour-arm* :angle-vector) av-seq)
+    (push *powder-pour-tilt-time* time-seq)
+
+    (send *toromi-robot* *pour-arm* :angle-vector start-larm-av)
+    (push (send *toromi-robot* *pour-arm* :angle-vector) av-seq)
+    (push *powder-pour-return-time* time-seq)
+
+    (list (reverse av-seq) (reverse time-seq))))
+
+(defun interpolate-angle-vector (start-av goal-av ratio)
+  (v+ start-av (scale ratio (v- goal-av start-av))))
+
+(defun larm-powder-pour-av-at-time (start-larm-av pour-plan elapsed-time)
+  (let ((from-av start-larm-av)
+        (target-avs (car pour-plan))
+        (target-times (cadr pour-plan))
+        (remaining-time elapsed-time))
+    (while (and target-avs target-times (> remaining-time (car target-times)))
+      (setq remaining-time (- remaining-time (car target-times)))
+      (setq from-av (car target-avs))
+      (setq target-avs (cdr target-avs))
+      (setq target-times (cdr target-times)))
+    (if (and target-avs target-times)
+        (interpolate-angle-vector
+         from-av
+         (car target-avs)
+         (min 1.0 (/ (float remaining-time) (car target-times))))
+      from-av)))
+
+(defun replace-larm-in-angle-vector (base-av larm-av)
+  (send *toromi-robot* :angle-vector base-av)
+  (send *toromi-robot* *pour-arm* :angle-vector larm-av)
+  (current-av))
+
+(defun add-larm-powder-pour-to-circle-plan (plan)
+  (let* ((av-seq (car plan))
+         (time-seq (cadr plan))
+         ;; pre-stir, approach, and the synchronized stir start pose.
+         (stir-start-index 3)
+         (pour-start-index
+          (+ stir-start-index
+             (* *powder-pour-after-cycle-count* *stir-cycle-steps*))))
+    (when (<= (length av-seq) pour-start-index)
+      (error "Circle continuous stir must continue past ~A cycles before powder pour."
+             *powder-pour-after-cycle-count*))
+    (send *toromi-robot* :angle-vector (nth (- pour-start-index 1) av-seq))
+    (let* ((start-larm-av (send *toromi-robot* *pour-arm* :angle-vector))
+           (pour-plan (plan-larm-powder-pour start-larm-av))
+           (pour-total-time (number-list-sum (cadr pour-plan)))
+           (available-time (number-list-sum (subseq time-seq pour-start-index))))
+      (when (< available-time pour-total-time)
+        (error "Circle continuous stir must continue at least ~A ms after the powder pour starts."
+               pour-total-time))
+      (let ((new-av-seq nil)
+            (index 0)
+            (elapsed-time 0)
+            (avs av-seq)
+            (times time-seq))
+        (while avs
+          (let ((base-av (car avs))
+                (step-time (car times)))
+            (if (< index pour-start-index)
+                (push base-av new-av-seq)
+              (progn
+                (setq elapsed-time (+ elapsed-time step-time))
+                (if (<= elapsed-time pour-total-time)
+                    (push
+                     (replace-larm-in-angle-vector
+                      base-av
+                      (larm-powder-pour-av-at-time
+                       start-larm-av pour-plan elapsed-time))
+                     new-av-seq)
+                  (push base-av new-av-seq)))))
+          (setq index (+ index 1))
+          (setq avs (cdr avs))
+          (setq times (cdr times)))
+        (list (reverse new-av-seq) time-seq)))))
 
 (defun stir-linear-half-range (motion)
   (if (eq motion :z-line)
@@ -550,13 +677,14 @@
     (push *stir-exit-time* time-seq)
     |#
 
-    (list (reverse av-seq) (reverse time-seq))))
+    (add-larm-powder-pour-to-circle-plan
+     (list (reverse av-seq) (reverse time-seq)))))
 
 (defun rarm-stir-demo
   (&key (execute t) (motion :circle) (mode :continuous) (repeat-count nil)
         (linear-speed nil) (linear-move-time nil)
         (stir-depth-offset nil) (stir-depth-from-cup-top nil))
-  "Move from the initial pose, keep the left arm fixed, and stir with the right arm."
+  "Move from the initial pose and stir with the right arm. In circle continuous mode, pour powder with the left arm after two cycles while stirring continues."
   (when (and (not (line-motion-p motion))
              (or linear-speed linear-move-time))
     (error "linear-speed/linear-move-time are only valid for line motions: ~A" motion))
