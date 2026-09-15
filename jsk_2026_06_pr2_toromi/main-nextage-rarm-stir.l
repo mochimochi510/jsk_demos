@@ -41,8 +41,7 @@
 (defparameter *stir-start-resync-time* 500)
 (defparameter *stir-exit-time* 2000)
 
-;; parameter for stirring-time　debug
-(defparameter *enable-motion-marker* nil)
+(defparameter *enable-cycle-marker* nil)
 (defparameter *single-trajectory-continuous-circle* t)
 
 (defun robot-local-pos (pos)
@@ -191,34 +190,15 @@
   (unless (ros::get-topic-publisher *motion-marker-topic*)
     (ros::advertise *motion-marker-topic* std_msgs::Header 10)))
 
-#|
 (defun publish-motion-marker (event-name)
   (init-motion-marker-publisher)
   (let ((stamp (ros::time-now)))
-    (dotimes (i 5)
-      (ros::publish
-       *motion-marker-topic*
-       (instance std_msgs::Header :init
-                 :stamp stamp
-                 :frame_id event-name))
-      (unix:usleep 10000))
+    (ros::publish
+     *motion-marker-topic*
+     (instance std_msgs::Header :init
+               :stamp stamp
+               :frame_id event-name))
     stamp))
-|#
-
-(defun publish-motion-marker (event-name)
-  (if (not *enable-motion-marker*)
-      nil
-    (progn
-      (init-motion-marker-publisher)
-      (let ((stamp (ros::time-now)))
-        (dotimes (i 5)
-          (ros::publish
-           *motion-marker-topic*
-           (instance std_msgs::Header :init
-                     :stamp stamp
-                     :frame_id event-name))
-          (unix:usleep 10000))
-        stamp))))
 
 (defun cycle-start-event-name (cycle-number)
   (cond
@@ -448,33 +428,6 @@
   (when (line-motion-p motion)
     (publish-motion-marker (stir-linear-stage-event motion 0))))
 
-#|
-(defun execute-stir-motion-with-markers
-  (av-seq time-seq motion mode &optional (first-stir-i 1))
-  (if (and (not (line-motion-p motion))
-           (not (eq mode :continuous)))
-      (execute-av-sequence av-seq time-seq)
-    (let* ((cycle-steps (stir-motion-cycle-steps motion))
-           (end-stir-i (+ first-stir-i (length av-seq)))
-           (stir-i first-stir-i))
-      (while (< stir-i end-stir-i)
-        (let* ((seq-start (- stir-i first-stir-i))
-               (chunk-end (stir-marker-chunk-end-index motion stir-i end-stir-i))
-               (seq-end (- chunk-end first-stir-i)))
-          (when (and (eq mode :continuous)
-                     (continuous-cycle-start-p stir-i first-stir-i cycle-steps))
-            (publish-motion-marker
-             (cycle-start-event-name
-              (continuous-cycle-number stir-i first-stir-i cycle-steps))))
-          (when (line-motion-p motion)
-            (publish-motion-marker
-             (stir-linear-stage-event motion (mod stir-i cycle-steps))))
-          (execute-av-sequence
-           (subseq av-seq seq-start seq-end)
-           (subseq time-seq seq-start seq-end))
-          (setq stir-i chunk-end))))))
-|#
-
 (defun execute-stir-motion-with-markers
   (av-seq time-seq motion mode &optional (first-stir-i 1))
 
@@ -509,7 +462,8 @@
                  motion stir-i end-stir-i))
                (seq-end (- chunk-end first-stir-i)))
 
-          (when (and (eq mode :continuous)
+          (when (and *enable-cycle-marker*
+                     (eq mode :continuous)
                      (continuous-cycle-start-p
                       stir-i first-stir-i cycle-steps))
             (publish-motion-marker
@@ -731,21 +685,9 @@
       (resync-stir-start-pose plan)
       (publish-motion-marker "baseline_end")
       (publish-motion-marker "rarm_stir_start")
-      #|
-      (let ((stir-av-seq (subseq (car plan) 3))
-            (stir-time-seq (subseq (cadr plan) 3)))
-        (execute-stir-motion-with-markers
-         stir-av-seq
-         stir-time-seq
-         motion
-         mode)
-        (execute-final-linear-endpoint-pause stir-av-seq motion))
-      |#
-      (let ((stir-av-seq (subseq (car plan) 3))
-            (stir-time-seq (subseq (cadr plan) 3)))
 
-        ;; Check the minimum executable duration first.
-        (report-fastest-times stir-av-seq stir-time-seq)
+      (let ((stir-av-seq (subseq (car plan) 3))
+            (stir-time-seq (subseq (cadr plan) 3)))
         
         ;; Measure only the stirring motion.
         (let ((motion-start-time (ros::time-now)))
