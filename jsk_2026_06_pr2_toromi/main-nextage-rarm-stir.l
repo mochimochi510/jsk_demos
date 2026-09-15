@@ -41,6 +41,10 @@
 (defparameter *stir-start-resync-time* 500)
 (defparameter *stir-exit-time* 2000)
 
+;; parameter for stirring-time　debug
+(defparameter *enable-motion-marker* nil)
+(defparameter *single-trajectory-continuous-circle* t)
+
 (defun robot-local-pos (pos)
   (send *toromi-robot* :transform-vector pos))
 
@@ -94,6 +98,75 @@
   (send *toromi-ri* :angle-vector-sequence av-seq time-seq)
   (when wait (send *toromi-ri* :wait-interpolation)))
 
+(defun report-fastest-times (av-seq time-seq)
+  ;; Match angle-vector-sequence defaults:
+  ;;   scale = 1
+  ;;   min-time = 0.0
+  (send *toromi-ri* :spin-once)
+
+  (let ((prev-av (send *toromi-ri* :state :potentio-vector))
+        (avs av-seq)
+        (tms time-seq)
+        (fastest-total 0.0)
+        (effective-total 0.0)
+        (requested-total 0.0)
+        (clamped-count 0)
+        (i 0)
+        av
+        requested-tm
+        fastest-tm
+        effective-tm)
+
+    (while avs
+      (setq av (car avs))
+      (setq requested-tm (car tms))
+
+      ;; Same calculation used inside :angle-vector-sequence
+      (setq fastest-tm
+            (* 1000.0
+               (send *toromi-ri*
+                     :angle-vector-duration
+                     prev-av
+                     av
+                     1
+                     0.0)))
+
+      ;; Actual tm used by angle-vector-sequence
+      (setq effective-tm
+            (max requested-tm fastest-tm))
+
+      (setq requested-total
+            (+ requested-total requested-tm))
+      (setq fastest-total
+            (+ fastest-total fastest-tm))
+      (setq effective-total
+            (+ effective-total effective-tm))
+
+      (when (> fastest-tm requested-tm)
+        (setq clamped-count (+ clamped-count 1)))
+
+      (format t
+              "~A: requested=~A ms  fastest=~A ms  effective=~A ms~%"
+              i requested-tm fastest-tm effective-tm)
+
+      (setq prev-av av)
+      (setq avs (cdr avs))
+      (setq tms (cdr tms))
+      (setq i (+ i 1)))
+
+    (format t "~%========================================~%")
+    (format t "Requested total : ~A ms (~A sec)~%"
+            requested-total (/ requested-total 1000.0))
+    (format t "Fastest-tm sum  : ~A ms (~A sec)~%"
+            fastest-total (/ fastest-total 1000.0))
+    (format t "Effective total : ~A ms (~A sec)~%"
+            effective-total (/ effective-total 1000.0))
+    (format t "Clamped points  : ~A / ~A~%"
+            clamped-count i)
+    (format t "========================================~%")
+
+    effective-total))
+
 (defun wait-before-stir ()
   (format t "~%Reached stir start position. Waiting ~A ms before stirring.~%"
           *stir-pause-time*)
@@ -118,6 +191,7 @@
   (unless (ros::get-topic-publisher *motion-marker-topic*)
     (ros::advertise *motion-marker-topic* std_msgs::Header 10)))
 
+#|
 (defun publish-motion-marker (event-name)
   (init-motion-marker-publisher)
   (let ((stamp (ros::time-now)))
@@ -129,6 +203,22 @@
                  :frame_id event-name))
       (unix:usleep 10000))
     stamp))
+|#
+
+(defun publish-motion-marker (event-name)
+  (if (not *enable-motion-marker*)
+      nil
+    (progn
+      (init-motion-marker-publisher)
+      (let ((stamp (ros::time-now)))
+        (dotimes (i 5)
+          (ros::publish
+           *motion-marker-topic*
+           (instance std_msgs::Header :init
+                     :stamp stamp
+                     :frame_id event-name))
+          (unix:usleep 10000))
+        stamp))))
 
 (defun cycle-start-event-name (cycle-number)
   (cond
@@ -358,6 +448,7 @@
   (when (line-motion-p motion)
     (publish-motion-marker (stir-linear-stage-event motion 0))))
 
+#|
 (defun execute-stir-motion-with-markers
   (av-seq time-seq motion mode &optional (first-stir-i 1))
   (if (and (not (line-motion-p motion))
@@ -382,6 +473,61 @@
            (subseq av-seq seq-start seq-end)
            (subseq time-seq seq-start seq-end))
           (setq stir-i chunk-end))))))
+|#
+
+(defun execute-stir-motion-with-markers
+  (av-seq time-seq motion mode &optional (first-stir-i 1))
+
+  (cond
+   ;; Timing test:
+   ;; Send all continuous-circle points as one trajectory.
+   ((and *single-trajectory-continuous-circle*
+         (eq motion :circle)
+         (eq mode :continuous))
+
+    (format t
+            "~%[Timing Test] Sending continuous circle as ONE trajectory: ~A points.~%"
+            (length av-seq))
+
+    (execute-av-sequence av-seq time-seq))
+
+   ;; Existing path for non-continuous, non-line motions.
+   ((and (not (line-motion-p motion))
+         (not (eq mode :continuous)))
+
+    (execute-av-sequence av-seq time-seq))
+
+   ;; Existing chunked execution.
+   (t
+    (let* ((cycle-steps (stir-motion-cycle-steps motion))
+           (end-stir-i (+ first-stir-i (length av-seq)))
+           (stir-i first-stir-i))
+      (while (< stir-i end-stir-i)
+        (let* ((seq-start (- stir-i first-stir-i))
+               (chunk-end
+                (stir-marker-chunk-end-index
+                 motion stir-i end-stir-i))
+               (seq-end (- chunk-end first-stir-i)))
+
+          (when (and (eq mode :continuous)
+                     (continuous-cycle-start-p
+                      stir-i first-stir-i cycle-steps))
+            (publish-motion-marker
+             (cycle-start-event-name
+              (continuous-cycle-number
+               stir-i first-stir-i cycle-steps))))
+
+          (when (line-motion-p motion)
+            (publish-motion-marker
+             (stir-linear-stage-event
+              motion
+              (mod stir-i cycle-steps))))
+
+          (execute-av-sequence
+           (subseq av-seq seq-start seq-end)
+           (subseq time-seq seq-start seq-end))
+
+          (setq stir-i chunk-end)))))))
 
 (defun final-linear-positive-endpoint-pause-p
   (motion stir-count &optional (first-stir-i 1))
@@ -585,6 +731,7 @@
       (resync-stir-start-pose plan)
       (publish-motion-marker "baseline_end")
       (publish-motion-marker "rarm_stir_start")
+      #|
       (let ((stir-av-seq (subseq (car plan) 3))
             (stir-time-seq (subseq (cadr plan) 3)))
         (execute-stir-motion-with-markers
@@ -592,6 +739,36 @@
          stir-time-seq
          motion
          mode)
+        (execute-final-linear-endpoint-pause stir-av-seq motion))
+      |#
+      (let ((stir-av-seq (subseq (car plan) 3))
+            (stir-time-seq (subseq (cadr plan) 3)))
+
+        ;; Check the minimum executable duration first.
+        (report-fastest-times stir-av-seq stir-time-seq)
+        
+        ;; Measure only the stirring motion.
+        (let ((motion-start-time (ros::time-now)))
+
+          (execute-stir-motion-with-markers
+          stir-av-seq
+          stir-time-seq
+          motion
+          mode)
+
+          (let* ((motion-end-time (ros::time-now))
+                (elapsed
+                  (send (ros::time- motion-end-time motion-start-time)
+                        :to-sec)))
+            (format t
+                    "~%========================================~%")
+            (format t
+                    "Stir motion elapsed time: ~A sec~%"
+                    elapsed)
+            (format t
+                    "========================================~%")))
+
+        ;; Keep this outside the timing measurement.
         (execute-final-linear-endpoint-pause stir-av-seq motion))
       (publish-motion-marker "rarm_stir_motion_end")
       (publish-motion-marker "rarm_stir_lift_pause_start")
