@@ -44,6 +44,20 @@
 (defparameter *enable-cycle-marker* nil)
 (defparameter *single-trajectory-continuous-circle* t)
 
+(defparameter *reset-larm-offset* #f(150 110 0))
+(defparameter *reset-larm-wrist-p-angle* 20.0)
+;; TODO: set the displacement from the reset-pose to above the powder-adding position.
+(defparameter *larm-powder-ready-offset* #f(0 0 -10))
+(defparameter *larm-powder-ready-time* 3000)
+(defparameter *larm-powder-elbow-r-angle* -20.0)
+(defparameter *larm-powder-wrist-p-angle* 0.0)
+;; World-frame displacement of the larm end-coords after tilting (x: forward, y: left).
+(defparameter *larm-powder-tilt-offset* #f(-10 -50 0))
+(defparameter *larm-powder-start-cycle* 3)
+(defparameter *larm-powder-velocity-ratio* 0.6)
+(defparameter *larm-powder-untilt-time* 2000)
+(defparameter *larm-return-reset-time* 3000)
+
 (defun robot-local-pos (pos)
   (send *toromi-robot* :transform-vector pos))
 
@@ -92,6 +106,14 @@
 
 (defun current-av ()
   (send *toromi-robot* :angle-vector))
+
+(defun av-with-larm (av larm-av)
+  (send *toromi-robot* :angle-vector av)
+  (send *toromi-robot* :larm :angle-vector larm-av)
+  (current-av))
+
+(defun av-seq-with-larm (av-seq larm-av)
+  (mapcar #'(lambda (av) (av-with-larm av larm-av)) av-seq))
 
 (defun execute-av-sequence (av-seq time-seq &key (wait t))
   (send *toromi-ri* :angle-vector-sequence av-seq time-seq)
@@ -215,11 +237,78 @@
   (send *toromi-robot* :reset-pose)
   (send *toromi-robot* :head :angle-vector #f(0 30))
   (send *toromi-robot* :larm :move-end-pos #f(0 0 150))
+  (send *toromi-robot* :larm :move-end-pos *reset-larm-offset* :world)
+  (send *toromi-robot* :larm-wrist-p :joint-angle *reset-larm-wrist-p-angle*)
   (send *toromi-robot* :rarm :move-end-pos #f(0 0 150))
   (when execute
     (send *toromi-ri* :angle-vector (send *toromi-robot* :angle-vector) time)
     (send *toromi-ri* :wait-interpolation))
   (send *toromi-robot* :angle-vector))
+
+(defun larm-powder-ready-pose ()
+  "Move the model's left arm above the powder-adding position."
+  (unless (send *toromi-robot* :larm :move-end-pos
+                *larm-powder-ready-offset* :world)
+    (error "IK failed for larm powder ready pose"))
+  (send *toromi-robot* :larm :angle-vector))
+
+(defun larm-add-powder ()
+  "Tilt the model's left arm to add powder."
+  (send *toromi-robot* :larm-wrist-p :joint-angle *larm-powder-wrist-p-angle*)
+  (send *toromi-robot* :larm-elbow-r :joint-angle *larm-powder-elbow-r-angle*)
+  (unless (send *toromi-robot* :larm :move-end-pos *larm-powder-tilt-offset* :world)
+    (error "IK failed for larm powder tilt offset"))
+  (send *toromi-robot* :larm :angle-vector))
+
+(defun larm-powder-tilt-av ()
+  (let* ((ready-av (send *toromi-robot* :larm :angle-vector))
+         (tilt-av (larm-add-powder)))
+    (send *toromi-robot* :larm :angle-vector ready-av)
+    tilt-av))
+
+(defun larm-powder-tilt-steps (ready-av tilt-av)
+  ;; Smallest step count that keeps every larm joint under
+  ;; *larm-powder-velocity-ratio* of its max velocity at *stir-step-time*.
+  (let ((step-sec (/ *stir-step-time* 1000.0))
+        (joints (send *toromi-robot* :larm :joint-list))
+        (steps 1))
+    (dotimes (i (length ready-av))
+      (let ((max-step-deg (* (rad2deg (send (elt joints i) :max-joint-velocity))
+                             step-sec
+                             *larm-powder-velocity-ratio*)))
+        (setq steps
+              (max steps
+                   (ceiling (/ (abs (- (elt tilt-av i) (elt ready-av i)))
+                               max-step-deg))))))
+    steps))
+
+(defun larm-powder-start-index ()
+  (when (< *larm-powder-start-cycle* 1)
+    (error "*larm-powder-start-cycle* must be >= 1: ~A" *larm-powder-start-cycle*))
+  (* (- *larm-powder-start-cycle* 1) *stir-cycle-steps*))
+
+(defun larm-powder-av-at (i ready-av tilt-av tilt-steps)
+  (let ((start-i (larm-powder-start-index)))
+    (cond
+     ((<= i start-i) ready-av)
+     ((>= i (+ start-i tilt-steps)) tilt-av)
+     (t (midpoint (/ (- i start-i) (float tilt-steps)) ready-av tilt-av)))))
+
+(defun move-larm-to-powder-ready (plan)
+  ;; The right arm is already at the stir start, so only the left arm moves.
+  (send *toromi-robot* :angle-vector (nth 2 (car plan)))
+  (send *toromi-ri* :angle-vector (current-av) *larm-powder-ready-time*)
+  (send *toromi-ri* :wait-interpolation))
+
+(defun return-larm-after-powder (larm-ready-av larm-reset-av)
+  ;; Untilt in place, then return to the reset-pose position.
+  ;; The right arm stays still with the spoon in the cup.
+  (send *toromi-robot* :larm :angle-vector larm-ready-av)
+  (send *toromi-ri* :angle-vector (current-av) *larm-powder-untilt-time*)
+  (send *toromi-ri* :wait-interpolation)
+  (send *toromi-robot* :larm :angle-vector larm-reset-av)
+  (send *toromi-ri* :angle-vector (current-av) *larm-return-reset-time*)
+  (send *toromi-ri* :wait-interpolation))
 
 (defun finish-rarm-stir ()
   (let ((target (send (send *toromi-robot* *stir-arm* :end-coords)
@@ -620,11 +709,14 @@
 (defun plan-rarm-stir-circle
   (&key (repeat-count nil)
         (stir-depth-offset nil) (stir-depth-from-cup-top nil))
-  (let ((steps (continuous-stir-steps :circle repeat-count))
-        (depth-offset (resolve-stir-depth-offset
-                       stir-depth-offset stir-depth-from-cup-top))
-        av-seq
-        time-seq)
+  (let* ((steps (continuous-stir-steps :circle repeat-count))
+         (depth-offset (resolve-stir-depth-offset
+                        stir-depth-offset stir-depth-from-cup-top))
+         (larm-ready-av (send *toromi-robot* :larm :angle-vector))
+         (larm-tilt-av (larm-powder-tilt-av))
+         (larm-tilt-steps (larm-powder-tilt-steps larm-ready-av larm-tilt-av))
+         av-seq
+         time-seq)
     (solve-rarm-ik (rhand-spoon-coords (pre-stir-tip-pos)))
     (push (current-av) av-seq)
     (push *pre-stir-time* time-seq)
@@ -640,6 +732,8 @@
         (solve-rarm-ik
          (rhand-spoon-coords
           (stir-tip-pos theta 0.0 depth-offset)))
+        (send *toromi-robot* :larm :angle-vector
+              (larm-powder-av-at i larm-ready-av larm-tilt-av larm-tilt-steps))
         (push (current-av) av-seq)
         (push *stir-step-time* time-seq)))
 
@@ -656,14 +750,17 @@
   (&key (execute t) (motion :circle) (mode :continuous) (repeat-count nil)
         (linear-speed nil) (linear-move-time nil)
         (stir-depth-offset nil) (stir-depth-from-cup-top nil))
-  "Move from the initial pose, keep the left arm fixed, and stir with the right arm."
+  "Move from the initial pose and stir with the right arm. The left arm moves above the powder-adding position and, in the circle stir, tilts to add powder."
   (when (and (not (line-motion-p motion))
              (or linear-speed linear-move-time))
     (error "linear-speed/linear-move-time are only valid for line motions: ~A" motion))
   (let ((depth-offset (resolve-stir-depth-offset
                        stir-depth-offset stir-depth-from-cup-top)))
     (reset-pose :execute nil)
-    (let ((plan (if (and (eq motion :circle) (eq mode :continuous))
+    (let* ((larm-reset-av (send *toromi-robot* :larm :angle-vector))
+           ;; Plan with the left arm above the powder-adding position.
+           (larm-ready-av (larm-powder-ready-pose))
+           (plan (if (and (eq motion :circle) (eq mode :continuous))
                     (plan-rarm-stir-circle
                      :repeat-count repeat-count
                      :stir-depth-offset depth-offset)
@@ -677,7 +774,9 @@
     (when execute
       (reset-pose :execute t)
       (publish-motion-marker "rarm_stir_prepare_start")
-      (execute-av-sequence (subseq (car plan) 0 3) (stir-start-approach-times (cadr plan)))
+      (execute-av-sequence (av-seq-with-larm (subseq (car plan) 0 3) larm-reset-av)
+                           (stir-start-approach-times (cadr plan)))
+      (move-larm-to-powder-ready plan)
       (publish-motion-marker "rarm_stir_pause_start")
       (publish-initial-linear-state-marker motion)
       (publish-motion-marker "baseline_start")
@@ -716,6 +815,7 @@
       (publish-motion-marker "rarm_stir_lift_pause_start")
       (wait-before-lift)
       (send *toromi-robot* :angle-vector (car (last (car plan))))
+      (return-larm-after-powder larm-ready-av larm-reset-av)
       (finish-rarm-stir)
       (publish-motion-marker "rarm_stir_finish_end"))
     plan)))
