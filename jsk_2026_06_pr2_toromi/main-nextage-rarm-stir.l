@@ -47,12 +47,12 @@
 (defparameter *reset-larm-offset* #f(150 110 0))
 (defparameter *reset-larm-wrist-p-angle* 20.0)
 ;; TODO: set the displacement from the reset-pose to above the powder-adding position.
-(defparameter *larm-powder-ready-offset* #f(0 0 -10))
+(defparameter *larm-powder-ready-offset* #f(-10 0 -10))
 (defparameter *larm-powder-ready-time* 3000)
-(defparameter *larm-powder-elbow-r-angle* -20.0)
+(defparameter *larm-powder-elbow-r-angle* -60.0)
 (defparameter *larm-powder-wrist-p-angle* 0.0)
 ;; World-frame displacement of the larm end-coords after tilting (x: forward, y: left).
-(defparameter *larm-powder-tilt-offset* #f(-10 -50 0))
+(defparameter *larm-powder-tilt-offset* #f(-100 -72 -140))
 (defparameter *larm-powder-start-cycle* 3)
 (defparameter *larm-powder-velocity-ratio* 0.6)
 (defparameter *larm-powder-untilt-time* 2000)
